@@ -5,40 +5,54 @@ import json
 import logging
 import logging.config
 import os
+import signal
+import sys
 import tarfile
 import time
-
 from datetime import datetime
-
-from experiment import Experiment, ExperimentList
 
 import centinel
 from centinel.backend import get_meta
 from centinel.primitives.tcpdump import Tcpdump
+from experiment import ExperimentList
+from centinel.vpn.cli import get_external_ip
 
 loaded_modules = set()
+# we need a global reference to stop it if we receive an interrupt.
+tds = []
 
+def signal_handler(signal, frame):
+        logging.warn('Interrupt signal received.')
+        if len(tds) > 0:
+            logging.warn('Stopping TCP dump...')
+            for td in tds:
+                td.stop()
+                td.delete()
+        logging.warn('Exiting...')
+        sys.exit(0)
 
-class Client():
+signal.signal(signal.SIGTERM, signal_handler)
 
-    def __init__(self, config):
+class Client:
+    def __init__(self, config, vpn_provider=None):
         self.config = config
         self.experiments = self.load_experiments()
         self._meta = None
+        self.vpn_provider = vpn_provider
 
     def setup_logging(self):
 
-        log_config = {'version':1,
-                      'formatters':{'error':{'format':self.config['log']['log_format']},
-                                    'debug':{'format':self.config['log']['log_format']}},
-                      'handlers':{'console':{'class':'logging.StreamHandler',
-                                             'formatter':'debug',
-                                             'level':self.config['log']['log_level']},
-                                  'file':{'class':'logging.FileHandler',
-                                          'filename':self.config['log']['log_file'],
-                                          'formatter':'error',
-                                          'level': self.config['log']['log_level']}},
-                      'root':{'handlers':('console', 'file'), 'level':self.config['log']['log_level']}}
+        log_config = {'version': 1,
+                      'formatters': {'error': {'format': self.config['log']['log_format']},
+                                     'debug': {'format': self.config['log']['log_format']}},
+                      'handlers': {'console': {'class': 'logging.StreamHandler',
+                                               'formatter': 'debug',
+                                               'level': self.config['log']['log_level']},
+                                   'file': {'class': 'logging.FileHandler',
+                                            'filename': self.config['log']['log_file'],
+                                            'formatter': 'error',
+                                            'level': self.config['log']['log_level']}},
+                      'root': {'handlers': ('console', 'file'), 'level': self.config['log']['log_level']}}
         logging.config.dictConfig(log_config)
 
         logging.debug("Finished setting up logging.")
@@ -48,14 +62,14 @@ class Client():
         return os.path.join(self.config['dirs']['results_dir'], result_file)
 
     def get_input_file(self, experiment_name):
-        input_file = "%s" % (experiment_name)
+        input_file = "%s" % experiment_name
         return os.path.join(self.config['dirs']['data_dir'], input_file)
 
     def load_input_file(self, name):
         input_file = self.get_input_file(name)
 
         if not os.path.isfile(input_file):
-            logging.error("Input file not found %s" % (input_file))
+            logging.error("Input file not found %s" % input_file)
             return None
 
         try:
@@ -63,7 +77,7 @@ class Client():
         except Exception as exp:
             logging.exception("Can not read from %s: %s" % (input_file, str(exp)))
             return None
-        logging.debug("Input file %s loaded." % (name))
+        logging.debug("Input file %s loaded." % name)
         return input_file_handle
 
     def load_experiments(self):
@@ -85,7 +99,7 @@ class Client():
                 logging.debug("Loaded experiment \"%s(%s)\"." % (name, path))
             except Exception as exception:
                 logging.exception("Failed to load experiment %s: %s" %
-                              (name, exception))
+                                  (name, exception))
 
         logging.debug("Finished loading experiments.")
         # return dict of experiment names and classes
@@ -104,11 +118,10 @@ class Client():
             run_next = sched_info[name]['last_run']
             run_next += sched_info[name]['frequency']
             if run_next <= time.time():
-                logging.debug("Client has experiment(s) to run (%s)." % (name))
+                logging.debug("Client has experiment(s) to run (%s)." % name)
                 return True
         logging.debug("Client has no experiments to run.")
         return False
-
 
     def get_meta(self):
         """we only want to get the meta information (our normalized IP) once,
@@ -117,7 +130,14 @@ class Client():
         """
         # get the normalized IP if we don't already have it
         if self._meta is None:
-            self._meta = get_meta(self.config)
+            external_ip = get_external_ip()
+            if external_ip:
+                self._meta = get_meta(self.config, external_ip)
+            else:
+                raise Exception("Unable to get public IP")
+            if 'custom_meta' in self.config:
+                self._meta['custom_meta'] = self.config['custom_meta']
+
         return self._meta
 
     def run(self, data_dir=None):
@@ -130,6 +150,8 @@ class Client():
         the scheduled interval in seconds, then the experiment will
         not be run.
 
+        :param data_dir:
+        :return:
         """
         # XXX: android build needs this. refactor
         if data_dir:
@@ -144,8 +166,6 @@ class Client():
                          "%s" % (self.config['dirs']['results_dir']))
             os.makedirs(self.config['dirs']['results_dir'])
         logging.debug("Results directory: %s" % (self.config['dirs']['results_dir']))
-
-        experiments_set = self.experiments.items()
 
         # load scheduler information
         sched_filename = os.path.join(self.config['dirs']['experiments_dir'],
@@ -183,13 +203,13 @@ class Client():
 
             # backward compatibility with older-style scheduler
             if 'python_exps' not in sched_info[name]:
-                self.run_exp(name)
+                self.run_exp(name=name)
             else:
                 exps = sched_info[name]['python_exps'].items()
                 for python_exp, exp_config in exps:
-                    logging.debug("Running %s." % (python_exp))
-                    self.run_exp(python_exp, exp_config, schedule_name=name)
-                    logging.debug("Finished running %s." % (python_exp))
+                    logging.debug("Running %s." % python_exp)
+                    self.run_exp(name=python_exp, exp_config=exp_config, schedule_name=name)
+                    logging.debug("Finished running %s." % python_exp)
             sched_info[name]['last_run'] = time.time()
 
         logging.debug("Updating timeout values in scheduler.")
@@ -203,21 +223,21 @@ class Client():
         logging.info("Finished running experiments. "
                      "Look in %s for results." % (self.config['dirs']['results_dir']))
 
-    def run_exp(self, name, exp_config=None, schedule_name=None):
+    def run_exp(self, name, exp_config=None, schedule_name=None, throw=False):
+        if name[-3:] == ".py":
+            name = name[:-3]
         if name not in self.experiments:
-            logging.error("Experiment file %s not found! Skipping." % (name))
+            logging.error("Experiment file %s not found! Skipping." % name)
         else:
-            Exp = self.experiments[name]
-            results = {}
-
-            results["meta"] = {}
+            exp_class = self.experiments[name]
+            results = {"meta": {}}
             try:
                 logging.debug("Getting metadata for experiment...")
                 meta = self.get_meta()
                 results["meta"] = meta
             except Exception as exception:
                 logging.exception("Error fetching metadata for "
-                              "%s: %s" % (name, exception))
+                                  "%s: %s" % (name, exception))
                 results["meta_exception"] = str(exception)
 
             if schedule_name is not None:
@@ -229,38 +249,60 @@ class Client():
             results["meta"]["client_time"] = start_time.isoformat()
 
             results["meta"]["centinel_version"] = centinel.__version__
+
+            # include vpn provider in metadata
+            if self.vpn_provider:
+                results["meta"]["vpn_provider"] = self.vpn_provider
+
             input_files = {}
             if exp_config is not None:
                 if (('input_files' in exp_config) and
-                   (exp_config['input_files'] is not None)):
+                        (exp_config['input_files'] is not None)):
                     for filename in exp_config['input_files']:
                         file_handle = self.load_input_file(filename)
                         if file_handle is not None:
                             input_files[filename] = file_handle
-                if (('params' in exp_config) and
-                   (exp_config['params'] is not None)):
-                    Exp.params = exp_config['params']
 
-            # if the experiment specifies a list of input file names,
+                if (('params' in exp_config) and
+                        (exp_config['params'] is not None)):
+                    exp_class.params = exp_config['params']
+
+            # if the scheduler does not specify input files, but
+            # the experiment class specifies a list of input file names,
             # load them. failing to load input files does not stop
             # experiment from running.
-            if Exp.input_files is not None:
-                for filename in Exp.input_files:
+            if len(input_files) == 0:
+                if exp_class.input_files is not None:
+                    for filename in exp_class.input_files:
+                        file_handle = self.load_input_file(filename)
+                        if file_handle is not None:
+                            input_files[filename] = file_handle
+                # otherwise, fall back to [schedule name].txt (deprecated)
+                else:
+                    filename = "%s.txt" % name
                     file_handle = self.load_input_file(filename)
                     if file_handle is not None:
                         input_files[filename] = file_handle
-            # otherwise, fall back on [experiment name].txt
-            else:
-                input_files = self.load_input_file("%s.txt" % (name))
 
             try:
                 # instantiate the experiment
-                logging.debug("Initializing the experiment class for %s" % (name))
-                exp = Exp(input_files)
+                logging.debug("Initializing the experiment class for %s" % name)
+
+                # these constants can be useful for some experiments, but it is not
+                # encouraged to use these directly
+                global_constants = {'experiments_dir': self.config['dirs']['experiments_dir'],
+                                    'results_dir': self.config['dirs']['results_dir'],
+                                    'data_dir': self.config['dirs']['data_dir']}
+
+                exp_class.global_constants = global_constants
+
+                exp = exp_class(input_files)
             except Exception as exception:
                 logging.exception("Error initializing %s: %s" % (name, exception))
                 results["init_exception"] = str(exception)
                 return
+
+            exp.global_constants = global_constants
 
             run_tcpdump = True
 
@@ -276,15 +318,16 @@ class Client():
                              "tcpdump will not start.")
                 run_tcpdump = False
 
-            if run_tcpdump and Exp.overrides_tcpdump:
+            if run_tcpdump and exp_class.overrides_tcpdump:
                 logging.info("Experiment overrides tcpdump recording.")
                 run_tcpdump = False
 
-            td = Tcpdump()
             tcpdump_started = False
 
             try:
                 if run_tcpdump:
+                    td = Tcpdump()
+                    tds.append(td)
                     td.start()
                     tcpdump_started = True
                     logging.info("tcpdump started...")
@@ -293,12 +336,21 @@ class Client():
             except Exception as exp:
                 logging.exception("Failed to run tcpdump: %s" % (exp,))
 
-            try:
-                # run the experiment
-                exp.run()
-            except Exception as exception:
-                logging.exception("Error running %s: %s" % (name, exception))
-                results["runtime_exception"] = str(exception)
+            if throw:
+                try:
+                    exp.run()
+                except KeyboardInterrupt:
+                    logging.warn("Keyboard interrupt received, stopping experiment...")
+            else:
+                try:
+                    # run the experiment
+                    exp.run()
+                except Exception as exception:
+                    logging.exception("Error running %s: %s" % (name, exception))
+                    results["runtime_exception"] = str(exception)
+                except KeyboardInterrupt:
+                    logging.warn("Keyboard interrupt received, stopping experiment...")
+
 
             # save any external results that the experiment has generated
             # they could be anything that doesn't belong in the json file
@@ -308,11 +360,11 @@ class Client():
             # keeping a list of files in the json results
             results_dir = self.config['dirs']['results_dir']
             if exp.external_results is not None:
-                logging.debug("Writing external files for %s" % (name))
+                logging.debug("Writing external files for %s" % name)
                 for fname, fcontents in exp.external_results.items():
                     external_file_name = ("external_%s-%s-%s"
                                           ".bz2" % (name,
-                                                    start_time.isoformat(),
+                                                    start_time.strftime("%Y-%m-%dT%H%M%S.%f"),
                                                     fname))
                     external_file_path = os.path.join(results_dir,
                                                       external_file_name)
@@ -321,12 +373,13 @@ class Client():
                             data = bz2.compress(fcontents)
                             file_p.write(data)
                             logging.debug("External file "
-                                          "%s written successfully" % (fname))
+                                          "%s written successfully" % fname)
                     except Exception as exp:
                         logging.exception("Failed to write external file:"
-                                        "%s" % (exp))
-                logging.debug("Finished writing external files for %s" % (name))
+                                          "%s" % exp)
+                logging.debug("Finished writing external files for %s" % name)
 
+            pcap_file_path = None
             if tcpdump_started:
                 logging.info("Waiting for tcpdump to process packets...")
                 # 5 seconds should be enough. this hasn't been tested on
@@ -334,37 +387,83 @@ class Client():
                 time.sleep(5)
                 td.stop()
                 logging.info("tcpdump stopped.")
+                bz2_successful = False
+                data = None
                 try:
                     pcap_file_name = ("pcap_%s-%s.pcap"
-                                      ".bz2" % (name, start_time.isoformat()))
+                                      ".bz2" % (name, start_time.strftime("%Y-%m-%dT%H%M%S.%f")))
                     pcap_file_path = os.path.join(results_dir,
                                                   pcap_file_name)
 
-                    with open(pcap_file_path, 'w:bz2') as file_p:
-                        data = bz2.compress(td.pcap())
-                        file_p.write(data)
-                        logging.info("Saved pcap to "
-                                     "%s." % (pcap_file_path))
+                    with open(pcap_file_path, 'wb') as pcap_bz2, open(td.pcap_filename(), 'rb') as pcap:
+                        compressor = bz2.BZ2Compressor()
+                        compressed_size_so_far = 0
+                        for pcap_data in iter(lambda: pcap.read(10 * 1024), b''):
+                            compressed_chunk  = compressor.compress(pcap_data)
+                            pcap_bz2.write(compressed_chunk)
+
+                            if len(compressed_chunk):
+                                compressed_size_so_far += len(compressed_chunk)
+
+                        compressed_chunk = compressor.flush()
+                        pcap_bz2.write(compressed_chunk)
+
+                        if len(compressed_chunk):
+                            compressed_size_so_far += len(compressed_chunk)
+                        uncompressed_size = os.path.getsize(td.pcap_filename())
+                        compression_ratio = 100 * (float(compressed_size_so_far) / float(uncompressed_size))
+                        logging.debug("pcap BZ2 compression: compressed/uncompressed (ratio):"
+                                      " %d/%d (%.1f%%)" % (compressed_size_so_far, uncompressed_size, compression_ratio))
+
+                    logging.info("Saved pcap to "
+                                 "%s." % pcap_file_path)
+                    bz2_successful = True
                 except Exception as exception:
-                    logging.exception("Failed to write pcap file: %s" %
-                                    (exception))
+                    logging.exception("Failed to compress and write "
+                                      "pcap file: %s" % exception)
+                if not bz2_successful:
+                    logging.info("Writing pcap file uncompressed")
+                    try:
+                        pcap_file_name = ("pcap_%s-%s"
+                                          ".pcap" % (name, start_time.strftime("%Y-%m-%dT%H%M%S.%f")))
+                        pcap_file_path = os.path.join(results_dir,
+                                                      pcap_file_name)
+
+                        with open(pcap_file_path, 'wb') as pcap_out, open(td.pcap_filename(), 'rb') as pcap:
+                            for pcap_data in iter(lambda: pcap.read(10 * 1024), b''):
+                                pcap_out.write(pcap_data)
+
+                        logging.info("Saved pcap to "
+                                     "%s." % pcap_file_path)
+                    except Exception as exception:
+                        logging.exception("Failed to write "
+                                          "pcap file: %s" % exception)
+                # delete pcap data to free up some memory
+                logging.debug("Removing pcap data from memory")
+                td.delete()
+                del data
+                del td
 
             # close input file handle(s)
-            logging.debug("Closing input files for %s" % (name))
+            logging.debug("Closing input files for %s" % name)
             if type(input_files) is dict:
                 for file_name, file_handle in input_files.items():
-                    file_handle.close()
-            else:
-                input_files.close()
-            logging.debug("Input files closed for %s" % (name))
+                    try:
+                        file_handle.close()
+                    except AttributeError:
+                        logging.warning("Closing %s failed" % file_name)
+            logging.debug("Input files closed for %s" % name)
 
-            logging.debug("Storing results for %s" % (name))
+            logging.debug("Storing results for %s" % name)
             try:
                 results[name] = exp.results
             except Exception as exception:
                 logging.exception("Error storing results for "
-                              "%s: %s" % (name, exception))
-                results["results_exception"] = str(exception)
+                                  "%s: %s" % (name, exception))
+                if "results_exception" not in results:
+                    results["results_exception"] = {}
+
+                results["results_exception"][name] = str(exception)
 
             end_time = datetime.now()
             time_taken = (end_time - start_time)
@@ -372,21 +471,27 @@ class Client():
 
             logging.info("%s took %s to finish." % (name, time_taken))
 
-            logging.debug("Saving %s results to file" % (name))
+            logging.debug("Saving %s results to file" % name)
+            result_file_path = None
             try:
-                # Pretty printing results will increase file size, but files are
+                # pretty printing results will increase file size, but files are
                 # compressed before sending.
-                result_file_path = self.get_result_file(name,
-                                                        start_time.isoformat())
+                result_file_path = self\
+                    .get_result_file(name, start_time.strftime("%Y-%m-%dT%H%M%S.%f"))
                 result_file = bz2.BZ2File(result_file_path, "w")
-                json.dump(results, result_file, indent=2,
-                          separators=(',', ': '))
+                # ignore encoding errors, these will be dealt with on the server
+                # Use dumps instead of dump because it handles unicode objects better
+                result_file.write(json.dumps(results, ensure_ascii=False).encode('utf-8'))
                 result_file.close()
+
+                # free up memory by deleting results from memory
+                del results
+                del result_file
             except Exception as exception:
                 logging.exception("Error saving results for "
-                              "%s to file: %s" % (name, exception))
-                results["results_exception"] = str(exception)
-            logging.debug("Done saving %s results to file" % (name))
+                                  "%s to file: %s" % (name, exception))
+            logging.debug("Done saving %s results to file" % name)
+            return (result_file_path, pcap_file_path)
 
     def consolidate_results(self):
         # bundle and compress result files
@@ -405,7 +510,7 @@ class Client():
                 if (files_archived % files_per_archive) == 0:
                     archive_count += 1
                     archive_filename = "results-%s_%d.tar.bz2" % (
-                        datetime.now().isoformat(), archive_count)
+                        datetime.now().strftime("%Y-%m-%dT%H%M%S.%f"), archive_count)
                     archive_file_path = os.path.join(results_dir,
                                                      archive_filename)
                     logging.info("Creating new archive"

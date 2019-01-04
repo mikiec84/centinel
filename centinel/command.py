@@ -4,6 +4,8 @@
 #
 # command.py: code to manage external programs with subprocess
 
+import os
+import signal
 import subprocess
 import threading
 import time
@@ -40,6 +42,7 @@ class Command():
         self.exception = None
         self.error = False
         self.notifications = ""
+        self.kill_switch = lambda: None
 
         self.thread = threading.Thread(target=self._invoke_cmd)
         self.thread.setDaemon(1)
@@ -67,7 +70,13 @@ class Command():
         if not timeout:
             timeout = self.timeout
         self.kill_switch()
+        # Send the signal to all the process groups
+        self.process.kill()
         self.thread.join(timeout)
+        try:
+            os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
+        except:
+            pass
         if self.stopped:
             return True
         else:
@@ -80,7 +89,8 @@ class Command():
             self.process = subprocess.Popen(self.command,
                                             stdin=subprocess.PIPE,
                                             stdout=subprocess.PIPE,
-                                            stderr=subprocess.STDOUT)
+                                            stderr=subprocess.STDOUT,
+                                            preexec_fn=os.setsid)
         except Exception as exp:
             self.exception = exp
             self.started = False

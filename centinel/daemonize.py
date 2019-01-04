@@ -3,6 +3,7 @@
 # daemonize.py: functionality to make centinel run in the background
 
 import os
+import shutil
 import stat
 import tempfile
 
@@ -22,13 +23,13 @@ def create_script_for_location(content, destination):
     temp = tempfile.NamedTemporaryFile(mode='w', delete=False)
     temp.write(content)
     temp.close()
-    os.rename(temp.name, destination)
+    shutil.move(temp.name, destination)
     cur_perms = os.stat(destination).st_mode
     set_perms = cur_perms | stat.S_IXOTH | stat.S_IXGRP | stat.S_IXUSR
     os.chmod(destination, set_perms)
 
 
-def daemonize(package, bin_loc):
+def daemonize(package, bin_loc, user):
     """Create crontab entries to run centinel every hour and
     autoupdate every day
 
@@ -48,13 +49,25 @@ def daemonize(package, bin_loc):
     Note: if the script already exists, this will delete it
 
     """
-    # create a script to run centinel every hour
-    hourly = "".join(["#!/bin/bash\n",
-                      "# cron job for centinel\n",
-                      bin_loc, " --sync\n",
-                      bin_loc, "\n",
-                      bin_loc, " --sync\n"])
-    create_script_for_location(hourly, "/etc/cron.hourly/centinel")
+
+    path = "/etc/cron.hourly/centinel-" + user
+
+    if user != "root":
+        # create a script to run centinel every hour as the current user
+        hourly = "".join(["#!/bin/bash\n",
+                          "# cron job for centinel\n",
+                          "su ", user, " -c '", bin_loc, " --sync'\n",
+                          "su ", user, " -c '", bin_loc, "'\n",
+                          "su ", user, " -c '", bin_loc, " --sync'\n"])
+    else:
+        # create a script to run centinel every hour as root
+        hourly = "".join(["#!/bin/bash\n",
+                          "# cron job for centinel\n",
+                          bin_loc, " --sync\n",
+                          bin_loc, "\n",
+                          bin_loc, " --sync\n"])
+
+    create_script_for_location(hourly, path)
 
     # create a script to get the client to autoupdate every day
     if package is None:
@@ -63,3 +76,5 @@ def daemonize(package, bin_loc):
                       "# autoupdater for centinel\n"
                       "sudo pip install --upgrade ", package, "\n"])
     create_script_for_location(updater, "/etc/cron.daily/centinel-autoupdate")
+    print "Successfully created cron jobs for user " + user
+

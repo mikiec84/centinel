@@ -10,24 +10,29 @@ import copy
 import logging
 import threading
 import time
-import trparse
 from sys import platform
+
+import trparse
 
 from centinel import command
 
+MAX_THREAD_START_RETRY = 10
+THREAD_START_DELAY = 3
 
 def traceroute(domain, method="udp", cmd_arguments=None,
                external=None, log_prefix=''):
-    """This function uses centinel.command to issue
+    """
+    This function uses centinel.command to issue
     a traceroute command, wait for it to finish execution and
     parse the results out to a dictionary.
 
-    Params:
-    domain-        the domain to be queried
-    method-        the packet type used for traceroute, ICMP by default
-    cmd_arguments- the list of arguments that need to be passed
-                   to traceroute.
-
+    :param domain: the domain to be queried
+    :param method: the packet type used for traceroute, UDP by default
+    :param cmd_arguments: the list of arguments that need to be passed
+                          to traceroute.
+    :param external:
+    :param log_prefix:
+    :return:
     """
 
     # the method specified by the function parameter here will
@@ -38,25 +43,27 @@ def traceroute(domain, method="udp", cmd_arguments=None,
     logging.debug("%sRunning traceroute for "
                   "%s using %s probes." % (log_prefix, domain, method))
 
+    results = {"method": method}
+
     if cmd_arguments is not None:
         _cmd_arguments = copy.deepcopy(cmd_arguments)
 
     if method == "tcp":
-        if platform in [ 'linux', 'linux2' ]:
+        if platform in ['linux', 'linux2']:
             _cmd_arguments.append('-T')
         elif platform == "darwin":
             _cmd_arguments.append('-P')
             _cmd_arguments.append('tcp')
 
     elif method == "udp":
-        if platform in [ 'linux', 'linux2' ]:
+        if platform in ['linux', 'linux2']:
             _cmd_arguments.append('-U')
         elif platform == "darwin":
             _cmd_arguments.append('-P')
             _cmd_arguments.append('udp')
 
     elif method == "icmp":
-        if platform in [ 'linux', 'linux2' ]:
+        if platform in ['linux', 'linux2']:
             _cmd_arguments.append('-I')
         elif platform == "darwin":
             _cmd_arguments.append('-P')
@@ -67,13 +74,12 @@ def traceroute(domain, method="udp", cmd_arguments=None,
     caller = command.Command(cmd, _traceroute_callback)
     caller.start()
     if not caller.started:
-        message = ""
         if caller.exception is not None:
             if "No such file or directory" in caller.exception:
                 message = "traceroute not found or not installed"
             else:
                 message = ("traceroute thread threw an "
-                           "exception: %s" (caller.exception))
+                           "exception: %s" % caller.exception)
         elif "enough privileges" in caller.notifications:
             message = "not enough privileges"
         elif "not known" in caller.notifications:
@@ -81,9 +87,7 @@ def traceroute(domain, method="udp", cmd_arguments=None,
         else:
             message = caller.notifications
 
-        results = {}
-        results["domain"] = domain
-        results["method"] = method
+        results["dest_name"] = domain
         results["error"] = message
         if external is not None and type(external) is dict:
             external[domain] = results
@@ -108,9 +112,7 @@ def traceroute(domain, method="udp", cmd_arguments=None,
     try:
         parsed_output = trparse.loads(output_string)
     except Exception as exc:
-        results = {}
-        results["domain"] = domain
-        results["method"] = method
+        results["dest_name"] = domain
         results["error"] = str(exc)
         results["raw"] = output_string
         if external is not None and type(external) is dict:
@@ -119,20 +121,18 @@ def traceroute(domain, method="udp", cmd_arguments=None,
 
     hops = list()
     for hop in parsed_output.hops:
-        hop_json = { "index" : hop.idx, "asn" : hop.asn }
+        hop_json = {"index": hop.idx, "asn": hop.asn}
         probes_json = []
         for probe in hop.probes:
-            probes_json.append({ "name" : probe.name,
-                              "ip" : probe.ip,
-                              "rtt" : probe.rtt,
-                              "anno" : probe.anno })
+            probes_json.append({"name": probe.name,
+                                "ip": probe.ip,
+                                "rtt": probe.rtt,
+                                "anno": probe.anno})
         hop_json["probes"] = probes_json
         hops.append(hop_json)
 
-    results = {}
     results["dest_name"] = parsed_output.dest_name
     results["dest_ip"] = parsed_output.dest_ip
-    results["method"] = method
     results["hops"] = hops
     results["forcefully_terminated"] = forcefully_terminated
     results["time_elapsed"] = time_elapsed
@@ -145,21 +145,19 @@ def traceroute(domain, method="udp", cmd_arguments=None,
     return results
 
 
-def traceroute_batch(input_list, method="udp", cmd_arguments=[],
+def traceroute_batch(input_list, results={}, method="udp", cmd_arguments=None,
                      delay_time=0.1, max_threads=100):
     """
     This is a parallel version of the traceroute primitive.
 
-    Params:
-    input_list-    the input is a list of domain names
-    method-        the packet type used for traceroute, ICMP by default
-    cmd_arguments- the list of arguments that need to be passed
-                   to traceroute.
-    delay_time-    delay before starting each thread
-    max_threads-   maximum number of concurrent threads
-
+    :param input_list: the input is a list of domain names
+    :param method: the packet type used for traceroute, UDP by default
+    :param cmd_arguments: the list of arguments that need to be passed
+                        to traceroute.
+    :param delay_time: delay before starting each thread
+    :param max_threads: maximum number of concurrent threads
+    :return:
     """
-    results = {}
     threads = []
     thread_error = False
     thread_wait_timeout = 200
@@ -188,16 +186,35 @@ def traceroute_batch(input_list, method="udp", cmd_arguments=[],
                                         results, log_prefix))
         ind += 1
         thread.setDaemon(1)
-        thread.start()
-        threads.append(thread)
+        thread_open_success = False
+        retries = 0
+        while not thread_open_success and retries < MAX_THREAD_START_RETRY:
+            try:
+                thread.start()
+                threads.append(thread)
+                thread_open_success = True
+            except:
+                retries += 1
+                time.sleep(THREAD_START_DELAY)
+                logging.error("%sThread start failed for %s, retrying... (%d/%d)" % (log_prefix, domain, retries, MAX_THREAD_START_RETRY))
+
+        if retries == MAX_THREAD_START_RETRY:
+            logging.error("%sCan't start a new thread for %s after %d retries." % (log_prefix, domain, retries))
 
     for thread in threads:
         thread.join(thread_wait_timeout)
 
     return results
 
+
 def _traceroute_callback(self, line, kill_switch):
-    """Callback function to handle traceroute.
+    """
+    Callback function to handle traceroute.
+
+    :param self:
+    :param line:
+    :param kill_switch:
+    :return:
     """
 
     line = line.lower()

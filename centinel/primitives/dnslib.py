@@ -8,6 +8,8 @@ import socket
 import threading
 import time
 
+MAX_THREAD_START_RETRY = 10
+THREAD_START_DELAY = 3
 
 def get_ips(host, nameserver=None, record="A"):
     nameservers = []
@@ -16,15 +18,18 @@ def get_ips(host, nameserver=None, record="A"):
     return lookup_domain(host, nameservers=nameservers, rtype=record)
 
 
-def lookup_domain(domain, nameservers=[], rtype="A", timeout=2):
+def lookup_domain(domain, nameservers=[], rtype="A",
+                  exclude_nameservers=[], timeout=2):
     """Wrapper for DNSQuery method"""
     dns_exp = DNSQuery(domains=[domain], nameservers=nameservers, rtype=rtype,
-                       timeout=timeout)
+                       exclude_nameservers=exclude_nameservers, timeout=timeout)
     return dns_exp.lookup_domain(domain)
 
 
-def lookup_domains(domains, nameservers=[], rtype="A", timeout=10):
-    dns_exp = DNSQuery(domains=domains, nameservers=nameservers, rtype=rtype,
+def lookup_domains(domains, results={}, nameservers=[], exclude_nameservers=[],
+                   rtype="A", timeout=2):
+    dns_exp = DNSQuery(domains=domains, results=results, nameservers=nameservers, 
+                       rtype=rtype, exclude_nameservers=exclude_nameservers, 
                        timeout=timeout)
     return dns_exp.lookup_domains()
 
@@ -34,11 +39,11 @@ def send_chaos_queries():
     return dns_exp.send_chaos_queries()
 
 
-class DNSQuery():
+class DNSQuery:
     """Class to store state for all of the DNS queries"""
 
-    def __init__(self, domains=[], nameservers=[], rtype="A", timeout=10,
-                 max_threads=100):
+    def __init__(self, domains=[], results={}, nameservers=[], exclude_nameservers=[],
+                 rtype="A", timeout=10, max_threads=100):
         """Constructor for the DNS query class
 
         Params:
@@ -48,14 +53,26 @@ class DNSQuery():
 
         """
         self.domains = domains
+        self.results = results
         self.rtype = rtype
         self.timeout = timeout
         self.max_threads = max_threads
-        if nameservers == []:
+        if len(nameservers) == 0:
             nameservers = dns.resolver.Resolver().nameservers
+        # remove excluded nameservers
+        if len(exclude_nameservers) > 0:
+            for nameserver in exclude_nameservers:
+                if nameserver in nameservers:
+                    nameservers.remove(nameserver)
+        # include google nameserver
+        if "8.8.8.8" not in nameservers:
+            nameservers.append("8.8.8.8")
         self.nameservers = nameservers
-        self.results = {}
         self.threads = []
+        # start point of port number to be used
+        self.port = 30000
+        # create thread lock for port number index
+        self.port_lock = threading.Lock()
 
     def send_chaos_queries(self):
         """Send chaos queries to identify the DNS server and its manufacturer
@@ -80,7 +97,7 @@ class DNSQuery():
                                                dns.rdataclass.from_text("CH"))
                 sock.sendto(query.to_wire(), (nameserver, 53))
                 reads, _, _ = select.select([sock], [], [], self.timeout)
-                if reads == []:
+                if len(reads) == 0:
                     self.results[name][nameserver] = None
                 else:
                     response = reads[0].recvfrom(4096)[0]
@@ -88,7 +105,7 @@ class DNSQuery():
         return self.results
 
     def lookup_domains(self):
-        """More complex DNS primitive that lookups domains concurrently
+        """More complex DNS primitive that looks up domains concurrently
 
         Note: if you want to lookup multiple domains, you should use
         this function
@@ -115,8 +132,22 @@ class DNSQuery():
                                           args=(domain, nameserver,
                                                 log_prefix))
                 thread.setDaemon(1)
-                thread.start()
-                self.threads.append(thread)
+
+                thread_open_success = False
+                retries = 0
+                while not thread_open_success and retries < MAX_THREAD_START_RETRY:
+                    try:
+                        thread.start()
+                        self.threads.append(thread)
+                        thread_open_success = True
+                    except:
+                        retries += 1
+                        time.sleep(THREAD_START_DELAY)
+                        logging.error("%sThread start failed for %s, retrying... (%d/%d)" % (log_prefix, domain, retries, MAX_THREAD_START_RETRY))
+
+                if retries == MAX_THREAD_START_RETRY:
+                    logging.error("%sCan't start a new thread for %s after %d retries." % (log_prefix, domain, retries))
+
             if thread_error:
                 break
             ind += 1
@@ -125,27 +156,53 @@ class DNSQuery():
             thread.join(self.timeout * 3)
         return self.results
 
-    def lookup_domain(self, domain, nameserver=None, log_prefix = ''):
-        """Most basic DNS primitive that lookups a domain, waits for a
+    def lookup_domain(self, domain, nameserver=None, log_prefix=''):
+        """Most basic DNS primitive that looks up a domain, waits for a
         second response, then returns all of the results
 
-        Params:
-        domain- the domain to lookup
-        nameserver- the nameserver to use
+        :param domain: the domain to lookup
+        :param nameserver: the nameserver to use
+        :param log_prefix:
+        :return:
 
         Note: if you want to lookup multiple domains you *should not* use
         this function, you should use lookup_domains because this does
         blocking IO to wait for the second response
 
         """
+        if domain not in self.results:
+            self.results[domain] = []
         # get the resolver to use
         if nameserver is None:
+            logging.debug("Nameserver not specified, using %s" % self.nameservers[0])
             nameserver = self.nameservers[0]
         results = {'domain': domain, 'nameserver': nameserver}
         # construct the socket to use
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.settimeout(self.timeout)
+        # set port number and increment index:
+        interrupt = False
+        with self.port_lock:
+            counter = 1
+            while True:
+                if counter > 100:
+                    logging.warning("Stop trying to get an available port")
+                    interrupt = True
+                    break
+                try:
+                    sock.bind(('', self.port))
+                    break
+                except socket.error:
+                    logging.debug("Port {} already in use, try next one".format(self.port))
+                    self.port += 1
+                    counter += 1
+            self.port += 1
+
+        if interrupt:
+            sock.close()
+            results['error'] = 'Failed to run DNS test'
+            self.results[domain].append(results)
+            return results
 
         logging.debug("%sQuerying DNS enteries for "
                       "%s (nameserver: %s)." % (log_prefix, domain, nameserver))
@@ -157,36 +214,58 @@ class DNSQuery():
         sock.sendto(request.to_wire(), (nameserver, 53))
 
         # read the first response from the socket
-        reads, _, _ = select.select([sock], [], [], self.timeout)
-        # if we didn't get anything, then set the results to nothing
-        if reads == []:
+        try:
+            response = sock.recvfrom(4096)[0]
+            results['response1'] = b64encode(response)
+            resp = dns.message.from_wire(response)
+            results['response1-ips'] = parse_out_ips(resp)
+
+            # first domain name in response should be the same with query
+            # domain name
+            for entry in resp.answer:
+                if domain.lower() != entry.name.to_text().lower()[:-1]:
+                    logging.debug("%sWrong domain name %s for %s!"
+                                  % (log_prefix, entry.name.to_text().lower()[:-1], domain))
+                    results['response1-domain'] = entry.name.to_text().lower()[:-1]
+                break
+        except socket.timeout:
+            # if we didn't get anything, then set the results to nothing
+            logging.debug("%sQuerying DNS enteries for "
+                          "%s (nameserver: %s) timed out!" % (log_prefix, domain, nameserver))
+            sock.close()
             results['response1'] = None
-            self.results[domain] = results
+            self.results[domain].append(results)
             return results
-        response = reads[0].recvfrom(4096)[0]
-        results['response1'] = b64encode(response)
-        resp = dns.message.from_wire(response)
-        results['response1-ips'] = self.parse_out_ips(resp)
 
         # if we have made it this far, then wait for the next response
-        reads, _, _ = select.select([sock], [], [], self.timeout)
-        # if we didn't get anything, then set the results to nothing
-        if reads == []:
+        try:
+            response2 = sock.recvfrom(4096)[0]
+            results['response2'] = b64encode(response2)
+            resp2 = dns.message.from_wire(response2)
+            results['response2-ips'] = parse_out_ips(resp2)
+
+            # first domain name in response should be the same with query
+            # domain name
+            for entry in resp2.answer:
+                if domain.lower != entry.name.to_text().lower()[:-1]:
+                    logging.debug("%sWrong domain name %s for %s!"
+                                  % (log_prefix, entry.name.to_text().lower()[:-1], domain))
+                    results['response2-domain'] = entry.name.to_text().lower()[:-1]
+                break
+        except socket.timeout:
+            # no second response
             results['response2'] = None
-            self.results[domain] = results
-            return results
-        response = reads[0].recvfrom(4096)[0]
-        results['response2'] = b64encode(response)
-        resp = dns.message.from_wire(response)
-        results['response2-ips'] = self.parse_out_ips(resp)
-        self.results[domain] = results
+
+        sock.close()
+        self.results[domain].append(results)
         return results
 
-    def parse_out_ips(self, message):
-        """Given a message, parse out the ips in the answer"""
 
-        ips = []
-        for entry in message.answer:
-            for rdata in entry.items:
-                ips.append(rdata.to_text())
-        return ips
+def parse_out_ips(message):
+    """Given a message, parse out the ips in the answer"""
+
+    ips = []
+    for entry in message.answer:
+        for rdata in entry.items:
+            ips.append(rdata.to_text())
+    return ips

@@ -101,7 +101,6 @@ class User:
                     os.remove(file_name)
             except Exception as exp:
                 logging.exception("Error trying to submit result: %s" % exp)
-                raise exp
 
     def sync_scheduler(self):
         """Download the scheduler.info file and perform a smart comparison
@@ -127,16 +126,28 @@ class User:
             logging.exception("Error trying to download scheduler.info: %s" % exp)
             raise exp
 
-        server_sched = json.loads(req.content)
+        try:
+            server_sched = json.loads(req.content)
+        except Exception as exp:
+            logging.exception("Error parsing server scheduler: %s" % exp)
+            raise exp
+
         sched_filename = os.path.join(self.config['dirs']['experiments_dir'],
                                       'scheduler.info')
         if not os.path.exists(sched_filename):
             with open(sched_filename, 'w') as file_p:
-                json.dump(server_sched, file_p)
+                json.dump(server_sched, file_p, indent=2,
+                      separators=(',', ': '))
             return
 
-        with open(sched_filename, 'r') as file_p:
-            client_sched = json.load(file_p)
+        client_sched = {}
+        try:
+            with open(sched_filename, 'r') as file_p:
+                client_sched = json.load(file_p)
+        except Exception as exp:
+            client_sched = {}
+            logging.exception("Error loading scheduler file: %s" % exp)
+            logging.info("Making an empty scheduler")
 
         # delete any scheduled tasks as necessary
         #
@@ -155,7 +166,8 @@ class User:
 
         # write out the results
         with open(sched_filename, 'w') as file_p:
-            json.dump(client_sched, file_p)
+            json.dump(client_sched, file_p, indent=2,
+                      separators=(',', ': '))
 
     def download_experiment(self, name):
         logging.info("Downloading experiment - %s", name)
@@ -256,7 +268,8 @@ class User:
                                  'password': self.password}
                 if self.typeable_handle is not None:
                     login_details['typeable_handle'] = self.typeable_handle
-                json.dump(login_details, login_fh)
+                json.dump(login_details, login_fh, indent=2,
+                      separators=(',', ': '))
         except Exception as exp:
             logging.exception("Unable to register: %s" % str(exp))
             raise exp
@@ -416,7 +429,8 @@ def get_meta(config, ip=''):
     try:
         req = requests.get(url,
                            proxies=config['proxy']['proxy'],
-                           verify=config['server']['verify'])
+                           verify=config['server']['verify'],
+                           timeout=10)
         req.raise_for_status()
         return req.json()
     except Exception as exp:

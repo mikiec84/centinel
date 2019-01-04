@@ -6,14 +6,18 @@ import logging
 try:
     import M2Crypto
     m2crypto_imported = True
-except:
+except ImportError:
     logging.warning("M2Crypto could not be imported. "
                     "TLS fingerprinting will be disabled.")
     m2crypto_imported = False
 
 import ssl
+import socket
 import threading
 import time
+
+MAX_THREAD_START_RETRY = 10
+THREAD_START_DELAY = 3
 
 
 def get_fingerprint(host, port=443, external=None, log_prefix=''):
@@ -23,6 +27,9 @@ def get_fingerprint(host, port=443, external=None, log_prefix=''):
 
     logging.debug("%sGetting TLS certificate "
                   "for %s:%d." % (log_prefix, host, port))
+    # set socket timeout to 10 seconds so that we don't have
+    # to wait forever if the server doesn't respond
+    socket.setdefaulttimeout(10)
 
     try:
         cert = ssl.get_server_certificate((host, port),
@@ -32,6 +39,9 @@ def get_fingerprint(host, port=443, external=None, log_prefix=''):
     except ssl.SSLError:
         # exception could also happen here
         try:
+
+            # this uses the highest version SSL or TLS that both 
+            # endpoints support
             cert = ssl.get_server_certificate((host, port),
                                               ssl_version=ssl.PROTOCOL_SSLv23)
         except Exception as exp:
@@ -77,19 +87,17 @@ def get_fingerprint(host, port=443, external=None, log_prefix=''):
         return fingerprint_error, tls_error
 
 
-def get_fingerprint_batch(input_list, default_port=443,
+def get_fingerprint_batch(input_list, results={}, default_port=443,
                           delay_time=0.5, max_threads=100):
     """
     This is a parallel version of the TLS fingerprint primitive.
 
-    Params:
-    input_list-   the input is a list of host:ports.
-    default_port- default port to use when no port specified
-    delay_time-   delay before starting each thread
-    max_threads-  maximum number of concurrent threads
-
+    :param input_list: the input is a list of host:ports.
+    :param default_port: default port to use when no port specified
+    :param delay_time: delay before starting each thread
+    :param max_threads: maximum number of concurrent threads
+    :return:
     """
-    results = {}
     threads = []
     thread_error = False
     thread_wait_timeout = 200
@@ -127,8 +135,21 @@ def get_fingerprint_batch(input_list, default_port=443,
                                         results, log_prefix))
         ind += 1
         thread.setDaemon(1)
-        thread.start()
-        threads.append(thread)
+
+        thread_open_success = False
+        retries = 0
+        while not thread_open_success and retries < MAX_THREAD_START_RETRY:
+            try:
+                thread.start()
+                threads.append(thread)
+                thread_open_success = True
+            except:
+                retries += 1
+                time.sleep(THREAD_START_DELAY)
+                logging.error("%sThread start failed for %s, retrying... (%d/%d)" % (log_prefix, host, retries, MAX_THREAD_START_RETRY))
+
+        if retries == MAX_THREAD_START_RETRY:
+            logging.error("%sCan't start a new thread for %s after %d retries." % (log_prefix, host, retries))
 
     for thread in threads:
         thread.join(thread_wait_timeout)
