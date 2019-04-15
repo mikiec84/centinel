@@ -23,22 +23,29 @@ import centinel.vpn.ipvanish as ipvanish
 import centinel.vpn.purevpn as purevpn
 import centinel.vpn.vpngate as vpngate
 import centinel.vpn.nordvpn as nordvpn
+import centinel.vpn.anexia as anexia
 
 PID_FILE = "/tmp/centinel.lock"
 
 def arg_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--auth-file', '-u', dest='auth_file', default=None,
-                        help=("File with HMA username on first line, \n"
-                              "HMA password on second line"))
+                        help=("File with VPN username on first line, \n"
+                              "VPN password on second line"))
     parser.add_argument('--crt-file', '-r', dest='crt_file', default=None,
                         help=("Certificate file for the current vpn\n"
                               "provider, if provided"))
     parser.add_argument('--tls-auth', '-t', dest='tls_auth', default=None,
                         help="Key for additional layer of authentication")
+    parser.add_argument('--secret', default=None,
+                        help=("Full path to file containing secret used to "
+                              "connect to VPN when using pre-shared key auth"))
     parser.add_argument('--key-direction', '-k', dest='key_direction', default=None,
                         help=("Key direction for tls auth, must specify when "
                               "tls-auth is used"))
+    parser.add_argument('--anexia-url', dest='anexia_url',
+                        default=anexia.DEFAULT_NODE_CSV_URL,
+                        help="URL to csv containing Anexia nodes")
     parser.add_argument('--reduce-endpoint', dest='reduce_vp',
                         action="store_true", default=False,
                         help="Reduce the number of vantage points by only connect to "
@@ -53,6 +60,9 @@ def arg_parser():
     g1.add_argument('--create-nordvpn-configs', dest='create_NORDVPN',
                     action='store_true',
                     help='Create the openvpn config files for NordVPN')
+    g1.add_argument('--create-anexia-configs', dest='create_ANEXIA',
+                    action='store_true',
+                    help='Create the openvpn config files for Anexia VPSs')
     g1.add_argument('--create-purevpn-configs', dest='create_PUREVPN',
                     action='store_true',
                     help='Create the openvpn config files for PureVPN')
@@ -544,6 +554,11 @@ def _run():
         elif args.create_NORDVPN:
             nordvpn_dir = return_abs_path(args.create_conf_dir, 'vpns')
             nordvpn.create_config_files(nordvpn_dir)
+        elif args.create_ANEXIA:
+            if args.secret is None:
+                argparse.ArgumentParser.error('--secret must be supplied for Anexia')
+            anexia_dir = return_abs_path(args.create_conf_dir, 'vpns')
+            anexia.create_config_files(anexia_dir, args.secret, args.anexia_url)
         elif args.create_PUREVPN:
             purevpn_dir = return_abs_path(args.create_conf_dir, 'vpns')
             purevpn.create_config_files(purevpn_dir)
