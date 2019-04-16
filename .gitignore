@@ -11,3 +11,4 @@ bin/
 .passfile
 build/
 .idea/
+update_vpns.sh
