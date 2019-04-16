@@ -417,6 +417,12 @@ def signal_handler(signal, frame):
             instance.stop()
     sys.exit(0)
 
+def ensure_dir_exists(dirname):
+    try:
+        os.mkdir(dirname)
+    except OSError as e:
+        if e.message.startswith('File exists'):
+            return
 
 def create_config_files(directory):
     """
@@ -436,23 +442,25 @@ def create_config_files(directory):
 
     vpn_dir = return_abs_path(directory, "vpns")
     conf_dir = return_abs_path(directory, "configs")
-    os.mkdir(conf_dir)
+    # If we're using multiple VPN providers in a single installation, these
+    # directories may already exist.
+    ensure_dir_exists(conf_dir)
     home_dirs = return_abs_path(directory, "home")
-    os.mkdir(home_dirs)
+    ensure_dir_exists(home_dirs)
     for filename in os.listdir(vpn_dir):
         configuration = centinel.config.Configuration()
         # setup the directories
         home_dir = os.path.join(home_dirs, filename)
-        os.mkdir(home_dir)
+        ensure_dir_exists(home_dir)
         configuration.params['user']['centinel_home'] = home_dir
         exp_dir = os.path.join(home_dir, "experiments")
-        os.mkdir(exp_dir)
+        ensure_dir_exists(exp_dir)
         configuration.params['dirs']['experiments_dir'] = exp_dir
         data_dir = os.path.join(home_dir, "data")
-        os.mkdir(data_dir)
+        ensure_dir_exists(data_dir)
         configuration.params['dirs']['data_dir'] = data_dir
         res_dir = os.path.join(home_dir, "results")
-        os.mkdir(res_dir)
+        ensure_dir_exists(res_dir)
         configuration.params['dirs']['results_dir'] = res_dir
 
         log_file = os.path.join(home_dir, "centinel.log")

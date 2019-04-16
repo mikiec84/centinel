@@ -1,0 +1,10 @@
+# This script removes any existing VPN configuration files that might exist. It
+# then downloads information about VPN nodes from NordVPN and creates new VPN
+# configuration files. This script should be run regularly to ensure VPN nodes
+# are kept up-to-date. You should probably point this python to a conda-managed
+# python.
+rm -rf ./new_vpn_config
+python vpn.py --create-nordvpn-configs --create-config ./new_vpn_config
+python vpn.py --create-anexia-configs --create-config ./new_vpn_config --secret ./static.key
+rm -rf ./vpn_config
+mv ./new_vpn_config ./vpn_config
